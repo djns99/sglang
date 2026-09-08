@@ -1534,7 +1534,10 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         if is_gfx95_mxfp8:
             allowed.append("triton")
 
-        if view.moe_a2a_backend == "flashinfer_megamoe":
+        if view.moe_a2a_backend in (
+            "flashinfer_megamoe",
+            "flashinfer_megamoe_split",
+        ):
             mxfp8_default = "flashinfer_megamoe"
         else:
             mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
@@ -1606,7 +1609,11 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
             )
             return {"disable_shared_experts_fusion": False}
         return {}
-    if view.moe_a2a_backend in ("flashinfer", "flashinfer_megamoe"):
+    if view.moe_a2a_backend in (
+        "flashinfer",
+        "flashinfer_megamoe",
+        "flashinfer_megamoe_split",
+    ):
         logger.warning(
             "FlashInfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
         )
@@ -1628,6 +1635,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "ascend_fuseep",
         "flashinfer",
         "flashinfer_megamoe",
+        "flashinfer_megamoe_split",
         "mori",
         "pplx",
         "deepep_v2",

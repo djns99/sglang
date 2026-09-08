@@ -1569,6 +1569,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         if get_moe_runner_backend().is_flashinfer_megamoe():
+            if (
+                get_moe_a2a_backend().is_flashinfer_megamoe_split()
+                and not self.use_mxfp8
+            ):
+                raise ValueError(
+                    "FlashInfer Split MegaMOE supports MXFP8 E4M3 experts only "
+                    "for Fp8MoEMethod."
+                )
             if not self.use_mxfp8 and not self.is_fp4_expert:
                 raise ValueError(
                     "FlashInfer MegaMOE supports MXFP8 or packed FP4 experts, "
@@ -1756,7 +1764,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.is_shuffled = True
                 layer.w2_weight.is_shuffled = True
             return
-        elif self.use_mxfp8 and get_moe_a2a_backend().is_flashinfer_megamoe():
+        elif self.use_mxfp8 and (
+            get_moe_a2a_backend().is_flashinfer_megamoe()
+            or get_moe_a2a_backend().is_flashinfer_megamoe_split()
+        ):
             from sglang.srt.layers.moe.flashinfer_megamoe import (
                 prepare_mxfp8_bf16_moe_weights_for_flashinfer_megamoe,
                 prepare_mxfp8_moe_weights_for_flashinfer_megamoe,
@@ -2810,6 +2821,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ensure_fp4_moe_layer_for_flashinfer_megamoe,
                 ensure_mxfp8_bf16_moe_layer_for_flashinfer_megamoe,
                 ensure_mxfp8_moe_layer_for_flashinfer_megamoe,
+                is_flashinfer_megamoe_split_path,
             )
 
             if self.use_mxfp8:
@@ -2829,6 +2841,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             quant_info = FlashInferMegaMoeQuantInfo(
                 mega=mega,
                 mega_forward=layer._flashinfer_megamoe_forward,
+                uses_split_ep=is_flashinfer_megamoe_split_path(),
                 apply_routed_scaling_factor=(
                     not layer.should_fuse_routed_scaling_factor_in_topk
                 ),

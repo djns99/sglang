@@ -1375,6 +1375,13 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
         )
         return server_args
 
+    def _make_split_args(self, **kwargs):
+        server_args = self._make_args(**kwargs)
+        server_args.moe_a2a_backend = "flashinfer_megamoe_split"
+        server_args.enable_dp_attention = False
+        server_args.dp_size = 1
+        return server_args
+
     @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
     def test_megamoe_accepts_audited_model_architectures(self, _):
         supported = (
@@ -1423,6 +1430,37 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
     def test_megamoe_requires_sm100_for_all_quantization_formats(self, _):
         with self.assertRaisesRegex(ValueError, "requires an SM100-family"):
             handle_a2a_moe(self._make_args(quantization="fp8", is_fp4_experts=True))
+
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
+    def test_split_megamoe_accepts_bf16_without_dp_attention(self, _):
+        args = self._make_split_args(quantization=None, dtype=torch.bfloat16)
+        args.moe_runner_backend = "auto"
+
+        handle_a2a_moe(args)
+
+        self.assertEqual(
+            resolution_result(args, "moe_runner_backend"), "flashinfer_megamoe"
+        )
+
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
+    def test_split_megamoe_forces_bf16_mxfp8_compute(self, _):
+        args = self._make_split_args(quantization="mxfp8")
+
+        handle_a2a_moe(args)
+
+        self.assertEqual(
+            resolution_result(args, "flashinfer_megamoe_mxfp8_precision"), "bf16"
+        )
+
+    def test_split_megamoe_rejects_nvfp4(self):
+        with self.assertRaisesRegex(ValueError, "supports only BF16"):
+            handle_a2a_moe(self._make_split_args())
+
+    def test_split_megamoe_rejects_in_kernel_fc2_reduce(self):
+        args = self._make_split_args(quantization=None, dtype=torch.bfloat16)
+        with envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.override("1"):
+            with self.assertRaisesRegex(ValueError, "IN_KERNEL_FC2_REDUCE"):
+                handle_a2a_moe(args)
 
     @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
     def test_megamoe_combine_dtype_accepts_quantized_values(self, _):

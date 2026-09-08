@@ -44,6 +44,7 @@ class MoeA2ABackend(Enum):
     DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
     FLASHINFER_MEGAMOE = "flashinfer_megamoe"
+    FLASHINFER_MEGAMOE_SPLIT = "flashinfer_megamoe_split"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -90,6 +91,9 @@ class MoeA2ABackend(Enum):
 
     def is_flashinfer_megamoe(self):
         return self == MoeA2ABackend.FLASHINFER_MEGAMOE
+
+    def is_flashinfer_megamoe_split(self):
+        return self == MoeA2ABackend.FLASHINFER_MEGAMOE_SPLIT
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
@@ -774,6 +778,8 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
         # The mega kernel does its EP all-to-all + combine internally and
         # returns per-rank outputs, so any further EP/TP all-reduce would
         # double-count. Same opt-in as the flashinfer a2a dispatcher.
+        return True
+    if get_moe_a2a_backend().is_flashinfer_megamoe_split():
         return True
     return False
 

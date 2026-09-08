@@ -661,6 +661,7 @@ class ExecMoe(msgspec.Struct):
             "ascend_tp",
             "pplx",
             "flashinfer_megamoe",
+            "flashinfer_megamoe_split",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -677,6 +678,7 @@ class ExecMoe(msgspec.Struct):
                 "pplx",
                 "ascend_tp",
                 "flashinfer_megamoe",
+                "flashinfer_megamoe_split",
             ],
             resolvable=True,
         ),
