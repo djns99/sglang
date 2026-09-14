@@ -252,17 +252,33 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
         flashinfer = types.ModuleType("flashinfer")
         flashinfer.__spec__ = importlib.machinery.ModuleSpec("flashinfer", loader=None)
         moe_ep = types.ModuleType("flashinfer.moe_ep")
+        fused_moe = types.ModuleType("flashinfer.fused_moe")
         for name in (
             "BootstrapConfig",
             "FleetParams",
-            "MegaMoeFc12Config",
+            "FusedMoeKernelConfig",
             "MoEEpSplitLayer",
             "MoEWeightPack",
             "NcclEpConfig",
             "SplitConfig",
         ):
             setattr(moe_ep, name, FakeConfig)
+        moe_ep.EpAlgorithm = SimpleNamespace(LOW_LATENCY="LOW_LATENCY")
+        moe_ep.EpLayout = SimpleNamespace(RANK_MAJOR="RANK_MAJOR")
+        for name in (
+            "BackendOptions",
+            "ExecutionConfig",
+            "ExpertConfig",
+            "MegaMoeFc12Config",
+            "MoEConfig",
+            "QuantConfig",
+            "RoutingConfig",
+            "SwiGLU",
+        ):
+            setattr(fused_moe, name, FakeConfig)
+        fused_moe.QuantVariant = SimpleNamespace(BF16="BF16", Bf16MxFp8="Bf16MxFp8")
         flashinfer.moe_ep = moe_ep
+        flashinfer.fused_moe = fused_moe
         w13 = torch.nn.Parameter(
             torch.empty(1, dtype=torch.bfloat16), requires_grad=False
         )
@@ -287,7 +303,11 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
         with (
             patch.dict(
                 sys.modules,
-                {"flashinfer": flashinfer, "flashinfer.moe_ep": moe_ep},
+                {
+                    "flashinfer": flashinfer,
+                    "flashinfer.moe_ep": moe_ep,
+                    "flashinfer.fused_moe": fused_moe,
+                },
             ),
             patch(
                 "sglang.srt.layers.moe.flashinfer_megamoe.is_flashinfer_megamoe_split_path",
@@ -309,8 +329,10 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
         self.assertIs(layer.w13_weight, w13)
         self.assertIs(layer.w2_weight, w2)
         self.assertEqual(
-            split_layer.kwargs["backend"].kwargs["kernel"].kwargs["variant"],
-            "sm100_bf16",
+            split_layer.kwargs["fleet_params"].kwargs["layout"], "RANK_MAJOR"
+        )
+        self.assertIn(
+            "moe_config", split_layer.kwargs["backend"].kwargs["kernel"].kwargs
         )
 
     def test_prepares_mxfp8_split_weights_without_rebinding(self):

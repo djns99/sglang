@@ -307,12 +307,6 @@ def _validate_flashinfer_megamoe_split_layer(layer: FusedMoE) -> None:
             "FlashInfer Split MegaMOE requires num_experts to be divisible by "
             f"ep_size, got {layer.num_experts=} and {world_size=}."
         )
-    capacity = _resolve_max_tokens_per_rank() * world_size
-    if capacity % 64:
-        raise ValueError(
-            "FlashInfer Split MegaMOE requires max_tokens_per_rank * ep_size "
-            f"to be divisible by 64, got {capacity}."
-        )
     if layer.top_k > 8:
         raise ValueError(
             "FlashInfer Split MegaMOE with NCCL-EP supports top_k <= 8, "
@@ -326,15 +320,37 @@ def _validate_flashinfer_megamoe_split_layer(layer: FusedMoE) -> None:
         )
 
 
+def _split_megamoe_quant_variant(variant: str) -> Any:
+    from flashinfer.fused_moe import QuantVariant
+
+    if variant == "sm100_bf16":
+        return QuantVariant.BF16
+    if variant == "sm100_bf16_mxfp8_e4m3":
+        return QuantVariant.Bf16MxFp8
+    raise ValueError(f"unsupported FlashInfer Split MegaMOE variant {variant!r}")
+
+
 def _ensure_flashinfer_megamoe_split_layer(layer: FusedMoE, *, variant: str) -> Any:
     split_layer = _get_or_init_flashinfer_megamoe_layer_state(layer)
     if split_layer is not None:
         return split_layer
 
+    from flashinfer.fused_moe import (
+        BackendOptions,
+        ExecutionConfig,
+        ExpertConfig,
+        MegaMoeFc12Config,
+        MoEConfig,
+        QuantConfig,
+        RoutingConfig,
+        SwiGLU,
+    )
     from flashinfer.moe_ep import (
         BootstrapConfig,
+        EpAlgorithm,
+        EpLayout,
         FleetParams,
-        MegaMoeFc12Config,
+        FusedMoeKernelConfig,
         MoEEpSplitLayer,
         MoEWeightPack,
         NcclEpConfig,
@@ -343,6 +359,23 @@ def _ensure_flashinfer_megamoe_split_layer(layer: FusedMoE, *, variant: str) -> 
 
     _validate_flashinfer_megamoe_split_layer(layer)
     world_size, rank = _layer_ep_world_rank(layer)
+    local_num_experts = layer.num_experts // world_size
+    max_tokens_per_rank = _resolve_max_tokens_per_rank()
+    swiglu_limit = layer.moe_runner_config.swiglu_limit
+    activation = SwiGLU() if swiglu_limit is None else SwiGLU(limit=float(swiglu_limit))
+    moe_config = MoEConfig(
+        routing=RoutingConfig(num_experts=layer.num_experts, top_k=layer.top_k),
+        quant=QuantConfig(variant=_split_megamoe_quant_variant(variant)),
+        experts=ExpertConfig(
+            intermediate_size=layer.intermediate_size_per_partition,
+            local_expert_offset=rank * local_num_experts,
+            local_num_experts=local_num_experts,
+        ),
+        activation=activation,
+        backend=BackendOptions(candidates=(MegaMoeFc12Config(),)),
+        execution=ExecutionConfig(tune_max_num_tokens=max_tokens_per_rank * world_size),
+    )
+    mixed = variant == "sm100_bf16_mxfp8_e4m3"
     split_layer = MoEEpSplitLayer(
         bootstrap=BootstrapConfig(
             world_size=world_size,
@@ -352,30 +385,20 @@ def _ensure_flashinfer_megamoe_split_layer(layer: FusedMoE, *, variant: str) -> 
         ),
         fleet_params=FleetParams(
             num_experts=layer.num_experts,
-            max_tokens_per_rank=_resolve_max_tokens_per_rank(),
+            max_tokens_per_rank=max_tokens_per_rank,
             token_hidden_size=layer.hidden_size,
+            algorithm=EpAlgorithm.LOW_LATENCY,
+            layout=EpLayout.RANK_MAJOR,
         ),
         weights=MoEWeightPack(
             w13=layer.w13_weight.data,
             w2=layer.w2_weight.data,
-            w13_scale=(
-                layer.w13_weight_scale_inv.data
-                if variant == "sm100_bf16_mxfp8_e4m3"
-                else None
-            ),
-            w2_scale=(
-                layer.w2_weight_scale_inv.data
-                if variant == "sm100_bf16_mxfp8_e4m3"
-                else None
-            ),
+            w13_scale=layer.w13_weight_scale_inv.data if mixed else None,
+            w2_scale=layer.w2_weight_scale_inv.data if mixed else None,
         ),
         backend=SplitConfig(
             comm=NcclEpConfig(),
-            kernel=MegaMoeFc12Config(
-                intermediate_size=layer.intermediate_size_per_partition,
-                variant=variant,
-                gate_up_clamp=layer.moe_runner_config.swiglu_limit,
-            ),
+            kernel=FusedMoeKernelConfig(moe_config=moe_config),
         ),
     )
     layer._flashinfer_megamoe_layer = split_layer
