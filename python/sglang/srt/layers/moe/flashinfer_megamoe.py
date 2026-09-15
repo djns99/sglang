@@ -320,13 +320,13 @@ def _validate_flashinfer_megamoe_split_layer(layer: FusedMoE) -> None:
         )
 
 
-def _split_megamoe_quant_variant(variant: str) -> Any:
-    from flashinfer.fused_moe import QuantVariant
+def _split_megamoe_weight_format(variant: str) -> Any:
+    from flashinfer.fused_moe import QuantFormat
 
     if variant == "sm100_bf16":
-        return QuantVariant.BF16
+        return QuantFormat.BF16
     if variant == "sm100_bf16_mxfp8_e4m3":
-        return QuantVariant.Bf16MxFp8
+        return QuantFormat.MXFP8
     raise ValueError(f"unsupported FlashInfer Split MegaMOE variant {variant!r}")
 
 
@@ -342,6 +342,7 @@ def _ensure_flashinfer_megamoe_split_layer(layer: FusedMoE, *, variant: str) -> 
         MegaMoeFc12Config,
         MoEConfig,
         QuantConfig,
+        QuantFormat,
         RoutingConfig,
         SwiGLU,
     )
@@ -365,7 +366,10 @@ def _ensure_flashinfer_megamoe_split_layer(layer: FusedMoE, *, variant: str) -> 
     activation = SwiGLU() if swiglu_limit is None else SwiGLU(limit=float(swiglu_limit))
     moe_config = MoEConfig(
         routing=RoutingConfig(num_experts=layer.num_experts, top_k=layer.top_k),
-        quant=QuantConfig(variant=_split_megamoe_quant_variant(variant)),
+        quant=QuantConfig(
+            weight=_split_megamoe_weight_format(variant),
+            activation=QuantFormat.BF16,
+        ),
         experts=ExpertConfig(
             intermediate_size=layer.intermediate_size_per_partition,
             local_expert_offset=rank * local_num_experts,

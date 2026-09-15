@@ -329,25 +329,10 @@ def handle_a2a_moe(server_args: Any):
                     "_handle_a2a_moe",
                     flashinfer_megamoe_mxfp8_precision="bf16",
                 )
-            if cfg.cuda_graph_config is not None:
-                declare_resolution(
-                    server_args,
-                    "_handle_a2a_moe",
-                    cuda_graph_config=with_phase(
-                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
-                    ),
-                )
-                declare_resolution(
-                    server_args,
-                    "_handle_a2a_moe",
-                    cuda_graph_config=with_phase(
-                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
-                    ),
-                )
             logger.info(
                 "FlashInfer Split MegaMOE is enabled with NCCL-EP dispatch "
-                "and combine; CUDA graphs are disabled. The expert parallel "
-                "size is adjusted to the tensor parallel size[%s].",
+                "and combine. The expert parallel size is adjusted to the "
+                "tensor parallel size[%s].",
                 cfg.tp_size,
             )
         else:
