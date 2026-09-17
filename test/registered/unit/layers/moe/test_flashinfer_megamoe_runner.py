@@ -40,6 +40,11 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
             MoeRunnerBackend.FLASHINFER_MEGAMOE.value,
         )
         self.assertIs(fused_func, run_flashinfer_megamoe)
+        split_fused_func = FusedOpPool.get_fused_func(
+            MoeA2ABackend.FLASHINFER_MEGAMOE_SPLIT.value,
+            MoeRunnerBackend.FLASHINFER_MEGAMOE.value,
+        )
+        self.assertIs(split_fused_func, run_flashinfer_megamoe)
 
     @patch(
         "sglang.srt.layers.moe.moe_runner.runner.get_moe_a2a_backend",
@@ -235,6 +240,142 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
         transformed = mega.kwargs["backend"].kwargs["transformed_weights"]
         self.assertIsNone(transformed[0][1])
         self.assertIsNone(transformed[1][1])
+
+    def test_prepares_bf16_split_weights_then_lazily_builds_layer(self):
+        class FakeConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def forward(self, tensors):
+                raise AssertionError("dummy forward function should not be called")
+
+        flashinfer = types.ModuleType("flashinfer")
+        flashinfer.__spec__ = importlib.machinery.ModuleSpec("flashinfer", loader=None)
+        moe_ep = types.ModuleType("flashinfer.moe_ep")
+        fused_moe = types.ModuleType("flashinfer.fused_moe")
+        for name in (
+            "BootstrapConfig",
+            "FleetParams",
+            "FusedMoeKernelConfig",
+            "MoEEpSplitLayer",
+            "MoEWeightPack",
+            "NcclEpConfig",
+            "SplitConfig",
+        ):
+            setattr(moe_ep, name, FakeConfig)
+        moe_ep.EpAlgorithm = SimpleNamespace(LOW_LATENCY="LOW_LATENCY")
+        moe_ep.EpLayout = SimpleNamespace(RANK_MAJOR="RANK_MAJOR")
+        for name in (
+            "BackendOptions",
+            "ExecutionConfig",
+            "ExpertConfig",
+            "MegaMoeFc12Config",
+            "MoEConfig",
+            "QuantConfig",
+            "RoutingConfig",
+            "SwiGLU",
+        ):
+            setattr(fused_moe, name, FakeConfig)
+        fused_moe.QuantVariant = SimpleNamespace(BF16="BF16", Bf16MxFp8="Bf16MxFp8")
+        flashinfer.moe_ep = moe_ep
+        flashinfer.fused_moe = fused_moe
+        w13 = torch.nn.Parameter(
+            torch.empty(1, dtype=torch.bfloat16), requires_grad=False
+        )
+        w2 = torch.nn.Parameter(
+            torch.empty(1, dtype=torch.bfloat16), requires_grad=False
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            num_experts=8,
+            hidden_size=2048,
+            intermediate_size_per_partition=128,
+            top_k=2,
+            w13_weight=w13,
+            w2_weight=w2,
+            moe_runner_config=SimpleNamespace(
+                activation="silu", is_gated=True, swiglu_limit=None
+            ),
+        )
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "flashinfer": flashinfer,
+                    "flashinfer.moe_ep": moe_ep,
+                    "flashinfer.fused_moe": fused_moe,
+                },
+            ),
+            patch(
+                "sglang.srt.layers.moe.flashinfer_megamoe.is_flashinfer_megamoe_split_path",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.moe.flashinfer_megamoe._resolve_max_tokens_per_rank",
+                return_value=64,
+            ),
+            patch(
+                "sglang.srt.layers.moe.flashinfer_megamoe._get_moe_ep_process_group",
+                return_value=object(),
+            ),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            prepare_bf16_moe_weights_for_flashinfer_megamoe(layer)
+            split_layer = ensure_bf16_moe_layer_for_flashinfer_megamoe(layer)
+
+        self.assertIs(layer.w13_weight, w13)
+        self.assertIs(layer.w2_weight, w2)
+        self.assertEqual(
+            split_layer.kwargs["fleet_params"].kwargs["layout"], "RANK_MAJOR"
+        )
+        self.assertIn(
+            "moe_config", split_layer.kwargs["backend"].kwargs["kernel"].kwargs
+        )
+
+    def test_prepares_mxfp8_split_weights_without_rebinding(self):
+        w13 = torch.nn.Parameter(
+            torch.empty(1, dtype=torch.float8_e4m3fn), requires_grad=False
+        )
+        w2 = torch.nn.Parameter(
+            torch.empty(1, dtype=torch.float8_e4m3fn), requires_grad=False
+        )
+        layer = SimpleNamespace(
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            num_experts=8,
+            hidden_size=2048,
+            intermediate_size_per_partition=128,
+            top_k=2,
+            w13_weight=w13,
+            w2_weight=w2,
+            w13_weight_scale_inv=torch.nn.Parameter(
+                torch.empty(1, dtype=torch.uint8), requires_grad=False
+            ),
+            w2_weight_scale_inv=torch.nn.Parameter(
+                torch.empty(1, dtype=torch.uint8), requires_grad=False
+            ),
+            moe_runner_config=SimpleNamespace(
+                activation="silu", is_gated=True, swiglu_limit=None
+            ),
+        )
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.flashinfer_megamoe.is_flashinfer_megamoe_split_path",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.moe.flashinfer_megamoe._resolve_max_tokens_per_rank",
+                return_value=64,
+            ),
+        ):
+            prepare_mxfp8_bf16_moe_weights_for_flashinfer_megamoe(layer)
+
+        self.assertIs(layer.w13_weight, w13)
+        self.assertIs(layer.w2_weight, w2)
 
     def test_prepares_mxfp8_bf16_weights_then_lazily_builds_layer(self):
         preprocess_args = {}

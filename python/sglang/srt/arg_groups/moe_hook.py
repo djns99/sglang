@@ -234,6 +234,41 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
         )
 
 
+def validate_flashinfer_megamoe_split_model(server_args: Any) -> None:
+    import torch
+
+    model_config = model_config_of(server_args)
+    quantization = resolved_view(server_args).quantization
+    supports_split_quantization = quantization == "mxfp8" or (
+        quantization is None and model_config.dtype == torch.bfloat16
+    )
+    if not supports_split_quantization:
+        raise ValueError(
+            "FlashInfer Split MegaMOE currently supports only BF16 or "
+            "serialized BF16xMXFP8 E4M3 MoE checkpoints; got "
+            f"quantization={quantization!r} with dtype={model_config.dtype}. "
+            "NVFP4, FP4-expert, standard FP8, and full-MXFP8 compute are unsupported."
+        )
+
+
+def validate_flashinfer_megamoe_split_envs() -> None:
+    if envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get():
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE is unsupported "
+            "by FlashInfer Split MegaMOE."
+        )
+    if envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.get().strip().lower() != "bf16":
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE is unsupported by "
+            "FlashInfer Split MegaMOE."
+        )
+    if envs.SGLANG_FLASHINFER_MEGAMOE_KNOBS.get() is not None:
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_KNOBS is unsupported by "
+            "FlashInfer Split MegaMOE."
+        )
+
+
 def handle_a2a_moe(server_args: Any):
     # The backend overrides and the ep_size=tp_size adjustments moved to
     # the resolution pipeline (arg_groups/overrides.py:
@@ -265,12 +300,16 @@ def handle_a2a_moe(server_args: Any):
             "--flashinfer-a2a-dispatch-type requires --moe-a2a-backend flashinfer."
         )
 
-    if a2a_backend == "flashinfer_megamoe":
+    if a2a_backend in ("flashinfer_megamoe", "flashinfer_megamoe_split"):
         validate_flashinfer_megamoe_model(server_args)
-        validate_flashinfer_megamoe_envs()
-        assert cfg.enable_dp_attention and cfg.dp_size == cfg.tp_size, (
-            "FlashInfer MegaMOE is only supported with dp_size == tp_size and --enable-dp-attention"
-        )
+        if a2a_backend == "flashinfer_megamoe":
+            validate_flashinfer_megamoe_envs()
+            assert (
+                cfg.enable_dp_attention and cfg.dp_size == cfg.tp_size
+            ), "FlashInfer MegaMOE is only supported with dp_size == tp_size and --enable-dp-attention"
+        else:
+            validate_flashinfer_megamoe_split_model(server_args)
+            validate_flashinfer_megamoe_split_envs()
         if resolved_view(server_args).moe_runner_backend == "auto":
             declare_resolution(
                 server_args, "_handle_a2a_moe", moe_runner_backend="flashinfer_megamoe"
@@ -283,11 +322,25 @@ def handle_a2a_moe(server_args: Any):
                 "FlashInfer MegaMOE currently requires an SM100-family "
                 "CUDA device for all supported quantization formats."
             )
-        logger.info(
-            "FlashInfer MegaMOE is enabled. The expert parallel size is "
-            "adjusted to be the same as the tensor parallel size[%s].",
-            cfg.tp_size,
-        )
+        if a2a_backend == "flashinfer_megamoe_split":
+            if resolved_view(server_args).quantization == "mxfp8":
+                declare_resolution(
+                    server_args,
+                    "_handle_a2a_moe",
+                    flashinfer_megamoe_mxfp8_precision="bf16",
+                )
+            logger.info(
+                "FlashInfer Split MegaMOE is enabled with NCCL-EP dispatch "
+                "and combine. The expert parallel size is adjusted to the "
+                "tensor parallel size[%s].",
+                cfg.tp_size,
+            )
+        else:
+            logger.info(
+                "FlashInfer MegaMOE is enabled. The expert parallel size is "
+                "adjusted to be the same as the tensor parallel size[%s].",
+                cfg.tp_size,
+            )
 
     if a2a_backend == "deepep":
         if cfg.moe_runner_backend == "flashinfer_cutedsl":

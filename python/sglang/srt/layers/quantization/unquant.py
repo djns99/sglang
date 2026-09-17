@@ -1046,10 +1046,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             from sglang.srt.layers.moe.flashinfer_megamoe import (
                 FlashInferMegaMoeQuantInfo,
                 ensure_bf16_moe_layer_for_flashinfer_megamoe,
+                is_flashinfer_megamoe_split_path,
             )
 
             quant_info = FlashInferMegaMoeQuantInfo(
                 mega=ensure_bf16_moe_layer_for_flashinfer_megamoe(layer),
+                uses_split_ep=is_flashinfer_megamoe_split_path(),
                 apply_routed_scaling_factor=(
                     not layer.should_fuse_routed_scaling_factor_in_topk
                 ),

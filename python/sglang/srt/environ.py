@@ -1017,9 +1017,9 @@ class Envs:
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
     # means each call site keeps its own default.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)
-    # FlashInfer MegaMOE (generic moe_ep.MoEEpMegaLayer backend). Sizes the
-    # per-rank symmetric workspace; must be >= the largest padded per-rank batch
-    # (derived from cuda_graph_max_bs / chunked_prefill_size when unset).
+    # FlashInfer MegaMOE capacity. Sizes the per-rank symmetric workspace for
+    # the fused path and the NCCL-EP receive buffer for the split path; must be
+    # >= the largest padded per-rank batch.
     SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK = EnvInt(0)
     # Opt-in in-kernel FC2 top-k reduce (cross-rank REDG atomic-add) for the
     # cutedsl mega kernels (BF16 / MXFP8xBF16 / NVFP4 / MXFP8). Deletes the multi-GB combine staging

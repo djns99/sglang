@@ -186,6 +186,8 @@ class Spec(msgspec.Struct):
                 "deepep_v2",
                 "pplx",
                 "ascend_tp",
+                "flashinfer_megamoe",
+                "flashinfer_megamoe_split",
             ],
             resolvable=True,
         ),

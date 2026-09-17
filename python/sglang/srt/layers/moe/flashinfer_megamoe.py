@@ -131,6 +131,7 @@ def _capture_safe_ue8m0_pack() -> Generator[None, None, None]:
 class FlashInferMegaMoeQuantInfo(MoeQuantInfo):
     mega: Any
     mega_forward: Callable[[Any, Any], torch.Tensor] | None = None
+    uses_split_ep: bool = False
     fc1_alpha: torch.Tensor | None = None
     fc2_alpha: torch.Tensor | None = None
     fc1_norm_const: torch.Tensor | None = None
@@ -193,6 +194,12 @@ def resolve_flashinfer_megamoe_combine_dtype() -> str:
             "SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE=1."
         )
     return combine_dtype
+
+
+def is_flashinfer_megamoe_split_path() -> bool:
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    return get_moe_a2a_backend().is_flashinfer_megamoe_split()
 
 
 def _layer_ep_world_rank(layer: FusedMoE) -> tuple[int, int]:
@@ -275,10 +282,132 @@ def _get_or_init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> Any:
     return layer._flashinfer_megamoe_layer
 
 
-def _get_or_init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> Any:
-    if "_flashinfer_megamoe_layer" not in vars(layer):
-        _init_flashinfer_megamoe_layer_state(layer)
-    return layer._flashinfer_megamoe_layer
+def _validate_flashinfer_megamoe_split_layer(layer: FusedMoE) -> None:
+    if not layer.moe_runner_config.is_gated:
+        raise ValueError("FlashInfer Split MegaMOE requires gated SwiGLU experts.")
+    if layer.moe_runner_config.activation != "silu":
+        raise ValueError(
+            "FlashInfer Split MegaMOE requires silu activation for SwiGLU experts."
+        )
+    if hasattr(layer, "w13_weight_bias") or hasattr(layer, "w2_weight_bias"):
+        raise ValueError("FlashInfer Split MegaMOE does not support expert biases.")
+    if layer.hidden_size % 32:
+        raise ValueError(
+            "FlashInfer Split MegaMOE requires hidden_size to be a multiple "
+            f"of 32, got {layer.hidden_size}."
+        )
+    if layer.intermediate_size_per_partition % 64:
+        raise ValueError(
+            "FlashInfer Split MegaMOE requires intermediate_size_per_partition "
+            f"to be a multiple of 64, got {layer.intermediate_size_per_partition}."
+        )
+    world_size, _ = _layer_ep_world_rank(layer)
+    if layer.num_experts % world_size:
+        raise ValueError(
+            "FlashInfer Split MegaMOE requires num_experts to be divisible by "
+            f"ep_size, got {layer.num_experts=} and {world_size=}."
+        )
+    if layer.top_k > 8:
+        raise ValueError(
+            "FlashInfer Split MegaMOE with NCCL-EP supports top_k <= 8, "
+            f"got {layer.top_k}."
+        )
+    if layer.hidden_size not in (2048, 2560, 4096, 5120, 6144, 7168, 8192):
+        raise ValueError(
+            "FlashInfer Split MegaMOE with NCCL-EP requires hidden_size in "
+            "{2048, 2560, 4096, 5120, 6144, 7168, 8192}, "
+            f"got {layer.hidden_size}."
+        )
+
+
+def _split_megamoe_weight_format(variant: str) -> Any:
+    from flashinfer.fused_moe import QuantFormat
+
+    if variant == "sm100_bf16":
+        return QuantFormat.BF16
+    if variant == "sm100_bf16_mxfp8_e4m3":
+        return QuantFormat.MXFP8
+    raise ValueError(f"unsupported FlashInfer Split MegaMOE variant {variant!r}")
+
+
+def _ensure_flashinfer_megamoe_split_layer(layer: FusedMoE, *, variant: str) -> Any:
+    split_layer = _get_or_init_flashinfer_megamoe_layer_state(layer)
+    if split_layer is not None:
+        return split_layer
+
+    from flashinfer.fused_moe import (
+        BackendOptions,
+        ExecutionConfig,
+        ExpertConfig,
+        MegaMoeFc12Config,
+        MoEConfig,
+        QuantConfig,
+        QuantFormat,
+        RoutingConfig,
+        SwiGLU,
+    )
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        EpAlgorithm,
+        EpLayout,
+        FleetParams,
+        FusedMoeKernelConfig,
+        MoEEpSplitLayer,
+        MoEWeightPack,
+        NcclEpConfig,
+        SplitConfig,
+    )
+
+    _validate_flashinfer_megamoe_split_layer(layer)
+    world_size, rank = _layer_ep_world_rank(layer)
+    local_num_experts = layer.num_experts // world_size
+    max_tokens_per_rank = _resolve_max_tokens_per_rank()
+    swiglu_limit = layer.moe_runner_config.swiglu_limit
+    activation = SwiGLU() if swiglu_limit is None else SwiGLU(limit=float(swiglu_limit))
+    moe_config = MoEConfig(
+        routing=RoutingConfig(num_experts=layer.num_experts, top_k=layer.top_k),
+        quant=QuantConfig(
+            weight=_split_megamoe_weight_format(variant),
+            activation=QuantFormat.BF16,
+        ),
+        experts=ExpertConfig(
+            intermediate_size=layer.intermediate_size_per_partition,
+            local_expert_offset=rank * local_num_experts,
+            local_num_experts=local_num_experts,
+        ),
+        activation=activation,
+        backend=BackendOptions(candidates=(MegaMoeFc12Config(),)),
+        execution=ExecutionConfig(tune_max_num_tokens=max_tokens_per_rank * world_size),
+    )
+    mixed = variant == "sm100_bf16_mxfp8_e4m3"
+    split_layer = MoEEpSplitLayer(
+        bootstrap=BootstrapConfig(
+            world_size=world_size,
+            rank=rank,
+            device=torch.cuda.current_device(),
+            process_group=_get_moe_ep_process_group(),
+        ),
+        fleet_params=FleetParams(
+            num_experts=layer.num_experts,
+            max_tokens_per_rank=max_tokens_per_rank,
+            token_hidden_size=layer.hidden_size,
+            algorithm=EpAlgorithm.LOW_LATENCY,
+            layout=EpLayout.RANK_MAJOR,
+        ),
+        weights=MoEWeightPack(
+            w13=layer.w13_weight.data,
+            w2=layer.w2_weight.data,
+            w13_scale=layer.w13_weight_scale_inv.data if mixed else None,
+            w2_scale=layer.w2_weight_scale_inv.data if mixed else None,
+        ),
+        backend=SplitConfig(
+            comm=NcclEpConfig(),
+            kernel=FusedMoeKernelConfig(moe_config=moe_config),
+        ),
+    )
+    layer._flashinfer_megamoe_layer = split_layer
+    layer._flashinfer_megamoe_forward = _select_megamoe_forward(split_layer)
+    return split_layer
 
 
 def _ensure_flashinfer_megamoe_layer(
@@ -437,6 +566,11 @@ def ensure_mxfp8_bf16_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     if mega is not None:
         return mega
 
+    if is_flashinfer_megamoe_split_path():
+        return _ensure_flashinfer_megamoe_split_layer(
+            layer, variant="sm100_bf16_mxfp8_e4m3"
+        )
+
     from flashinfer.moe_ep import Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
 
     return _ensure_flashinfer_megamoe_layer(
@@ -460,6 +594,9 @@ def ensure_bf16_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
     if mega is not None:
         return mega
+
+    if is_flashinfer_megamoe_split_path():
+        return _ensure_flashinfer_megamoe_split_layer(layer, variant="sm100_bf16")
 
     from flashinfer.moe_ep import Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
 
@@ -635,6 +772,17 @@ def prepare_mxfp8_bf16_moe_weights_for_flashinfer_megamoe(
 ) -> None:
     _init_flashinfer_megamoe_layer_state(layer)
 
+    if is_flashinfer_megamoe_split_path():
+        _validate_flashinfer_megamoe_split_layer(layer)
+        if (
+            layer.w13_weight.dtype != torch.float8_e4m3fn
+            or layer.w2_weight.dtype != torch.float8_e4m3fn
+        ):
+            raise ValueError(
+                "FlashInfer Split MegaMOE requires MXFP8 E4M3 expert weights."
+            )
+        return
+
     from flashinfer.moe_ep import MoEWeightPack
     from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl import (
         preprocess_mega_weights,
@@ -696,6 +844,9 @@ def prepare_bf16_moe_weights_for_flashinfer_megamoe(layer: FusedMoE) -> None:
         or layer.w2_weight.dtype != torch.bfloat16
     ):
         raise ValueError("FlashInfer BF16 MegaMOE requires bfloat16 expert weights.")
+    if is_flashinfer_megamoe_split_path():
+        _validate_flashinfer_megamoe_split_layer(layer)
+        return
     if not layer.moe_runner_config.is_gated:
         raise ValueError("FlashInfer BF16 MegaMOE requires gated SwiGLU experts.")
     if layer.moe_runner_config.activation != "silu":
@@ -781,6 +932,7 @@ def _ensure_shared_workspace(mega: Any) -> None:
         mega._workspace = shared
 
 
+@register_fused_func("flashinfer_megamoe_split", "flashinfer_megamoe")
 @register_fused_func("flashinfer_megamoe", "flashinfer_megamoe")
 def run_flashinfer_megamoe(
     dispatch_output: DispatchOutput,
@@ -801,7 +953,8 @@ def run_flashinfer_megamoe(
     topk_weights = topk_output.topk_weights
     topk_ids = topk_output.topk_ids
     mega = quant_info.mega
-    _ensure_shared_workspace(mega)
+    if not quant_info.uses_split_ep:
+        _ensure_shared_workspace(mega)
 
     t = MoEEpTensors(
         hidden_states=x.to(torch.bfloat16),
